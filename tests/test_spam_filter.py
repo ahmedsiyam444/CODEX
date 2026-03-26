@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spam_filter import SpamFilterModel, load_model, save_model
+from spam_filter import SpamFilterModel, _iter_csv_string, load_model, save_model
 
 
 class SpamFilterTests(unittest.TestCase):
@@ -28,6 +28,12 @@ class SpamFilterTests(unittest.TestCase):
             reloaded = load_model(path)
             label, _ = reloaded.predict_with_score("buy cheap now")
             self.assertEqual(label, "spam")
+
+    def test_csv_string_parser(self):
+        csv_data = "label,text\nspam,Win cash now\nham,Project update attached\n"
+        rows = list(_iter_csv_string(csv_data))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][0], "spam")
 
 
 if __name__ == "__main__":

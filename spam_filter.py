@@ -12,10 +12,13 @@ import csv
 import json
 import math
 import re
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
 WORD_RE = re.compile(r"[a-z0-9']+")
 
@@ -210,6 +213,159 @@ def classify_file_command(args: argparse.Namespace) -> int:
     return 0
 
 
+HTML_PAGE = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Spam Filter</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; line-height: 1.4; }
+    textarea, input[type=text] { width: 100%; padding: 8px; }
+    textarea { min-height: 80px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    button { padding: 8px 14px; cursor: pointer; }
+    .hint { color: #666; font-size: 14px; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Local Email Spam Filter</h1>
+  <p class="hint">Model file: <code>{model_path}</code></p>
+
+  <div class="card">
+    <h2>Train / Update Model</h2>
+    <p class="hint">Paste CSV rows with header <code>label,text</code>. Existing model will be updated if present.</p>
+    <form method="POST" action="/train">
+      <textarea name="csv_data" placeholder="label,text&#10;spam,Win cash now&#10;ham,Team meeting at 2pm"></textarea>
+      <button type="submit">Train/Update</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Predict One Email</h2>
+    <form method="POST" action="/predict">
+      <textarea name="text" placeholder="Paste email text here..."></textarea>
+      <button type="submit">Predict</button>
+    </form>
+  </div>
+
+  <p class="hint">API endpoints: <code>POST /api/train</code>, <code>POST /api/predict</code>.</p>
+</body>
+</html>
+"""
+
+
+def _read_form_data(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    length = int(handler.headers.get("Content-Length", "0"))
+    raw = handler.rfile.read(length).decode("utf-8")
+    return {k: v[0] for k, v in parse_qs(raw).items()}
+
+
+def _iter_csv_string(csv_data: str) -> Iterable[tuple[str, str]]:
+    rows = csv.DictReader(csv_data.splitlines())
+    if {"label", "text"} - set(rows.fieldnames or []):
+        raise ValueError("CSV must include header: label,text")
+    for row in rows:
+        label = (row.get("label") or "").strip()
+        text = (row.get("text") or "").strip()
+        if label and text:
+            yield label, text
+
+
+def serve_command(args: argparse.Namespace) -> int:
+    model_path = Path(args.model)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send_html(self, code: int, body: str) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _send_json(self, code: int, data: dict) -> None:
+            payload = json.dumps(data).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _load_or_init_model(self) -> SpamFilterModel:
+            if model_path.exists():
+                return load_model(model_path)
+            return SpamFilterModel()
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self._send_html(HTTPStatus.OK, HTML_PAGE.format(model_path=model_path))
+                return
+            if parsed.path == "/health":
+                self._send_json(HTTPStatus.OK, {"ok": True})
+                return
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            try:
+                form = _read_form_data(self)
+                if parsed.path in {"/train", "/api/train"}:
+                    model = self._load_or_init_model()
+                    trained = 0
+                    for label, text in _iter_csv_string(form.get("csv_data", "")):
+                        model.update(label, text)
+                        trained += 1
+                    if trained == 0:
+                        raise ValueError("No valid rows to train.")
+                    save_model(model, model_path)
+                    response = {
+                        "status": "ok",
+                        "trained_rows": trained,
+                        "model": str(model_path),
+                    }
+                    if parsed.path == "/train":
+                        self._send_html(
+                            HTTPStatus.OK,
+                            f"<p>Trained/updated with {trained} rows.</p><p><a href='/'>Back</a></p>",
+                        )
+                    else:
+                        self._send_json(HTTPStatus.OK, response)
+                    return
+
+                if parsed.path in {"/predict", "/api/predict"}:
+                    model = self._load_or_init_model()
+                    text = (form.get("text") or "").strip()
+                    if not text:
+                        raise ValueError("Missing text")
+                    label, confidence = model.predict_with_score(text)
+                    response = {"label": label, "confidence": round(confidence, 4)}
+                    if parsed.path == "/predict":
+                        self._send_html(
+                            HTTPStatus.OK,
+                            f"<p>Prediction: <b>{label}</b> ({confidence:.4f})</p><p><a href='/'>Back</a></p>",
+                        )
+                    else:
+                        self._send_json(HTTPStatus.OK, response)
+                    return
+
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            except Exception as exc:  # broad to return API-safe errors
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Server running at http://{args.host}:{args.port}")
+    print("Press Ctrl+C to stop")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Email spam filter trainer and classifier")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -234,6 +390,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--data", required=True, help="CSV with at least a text column")
     batch.add_argument("--output", default="predictions.csv", help="Output CSV path")
     batch.set_defaults(func=classify_file_command)
+
+    serve = sub.add_parser("serve", help="Run local web UI/API for training and prediction")
+    serve.add_argument("--model", default="model/spam_model.json", help="Model JSON path")
+    serve.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8000, help="Port to bind (default: 8000)")
+    serve.set_defaults(func=serve_command)
 
     return parser
 

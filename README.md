@@ -8,6 +8,7 @@ This project gives you a **working spam filter** that can learn from your own la
 - Predicts if one email is spam.
 - Classifies an entire CSV file.
 - Supports incremental retraining when you provide more emails.
+- Includes a localhost web UI/API so you can use it in browser.
 
 No external Python packages are required.
 
@@ -71,5 +72,23 @@ python3 spam_filter.py classify-file --model model/spam_model.json --data incomi
 ```bash
 python3 spam_filter.py update --data more_labeled_emails.csv --model model/spam_model.json
 ```
+
+## 6) Run on localhost (browser URL)
+
+Start local server:
+
+```bash
+python3 spam_filter.py serve --host 127.0.0.1 --port 8000
+```
+
+Open in browser:
+
+```text
+http://127.0.0.1:8000
+```
+
+API endpoints:
+- `POST /api/train` with form field `csv_data` (`label,text` CSV content)
+- `POST /api/predict` with form field `text`
 
 This app is fully local, so your email data stays on your machine.
